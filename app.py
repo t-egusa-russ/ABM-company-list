@@ -39,6 +39,14 @@ from data_manager import (
     EMPLOYEE_RANGES,
     OVERSEAS_OPTIONS,
 )
+from subsidy import (
+    collect_subsidies,
+    init_subsidy_db,
+    upsert_subsidies,
+    get_subsidies_since,
+    get_all_subsidies,
+    build_excel_report,
+)
 
 # --- ページ設定 ---
 st.set_page_config(
@@ -212,7 +220,9 @@ with col5:
 st.divider()
 
 # --- タブ構成 ---
-tab_search, tab_list, tab_add = st.tabs(["企業検索", "企業リスト", "手動追加"])
+tab_search, tab_list, tab_add, tab_subsidy = st.tabs(
+    ["企業検索", "企業リスト", "手動追加", "補助金レポート"]
+)
 
 # ===== タブ1: 企業検索 =====
 with tab_search:
@@ -519,3 +529,104 @@ with tab_add:
                     st.success(f"{m_name} を登録しました")
                 else:
                     st.warning(msg)
+
+
+# ===== タブ4: 補助金レポート =====
+with tab_subsidy:
+    st.subheader("海外輸出関連 補助金レポート")
+    st.caption(
+        "国内の行政・金融機関・自治体・公的機関・営利団体が公表している海外輸出関連の補助金を週次で収集します。"
+        "毎週月曜 12:00（JST）に GitHub Actions が自動実行し、Excel付きでメール送信されます。"
+    )
+
+    init_subsidy_db()
+
+    sub_col1, sub_col2 = st.columns([1, 1])
+    with sub_col1:
+        days_window = st.selectbox(
+            "表示期間",
+            options=[7, 14, 30, 90],
+            index=0,
+            format_func=lambda d: f"直近 {d} 日",
+            key="subsidy_days",
+        )
+    with sub_col2:
+        manual_run = st.button("今すぐ収集を実行", type="secondary")
+
+    if manual_run:
+        if not api_key or not search_engine_id:
+            st.error("Google API Key と Search Engine ID を先に設定してください")
+        else:
+            with st.spinner("補助金情報を収集中..."):
+                try:
+                    items = collect_subsidies(
+                        api_key=api_key,
+                        search_engine_id=search_engine_id,
+                        results_per_query=5,
+                    )
+                    new_count, update_count = upsert_subsidies(
+                        [i.to_dict() for i in items]
+                    )
+                    st.success(
+                        f"収集完了: 新規 {new_count} 件 / 既存更新 {update_count} 件"
+                    )
+                except RuntimeError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"収集エラー: {e}")
+
+    new_subsidies = get_subsidies_since(days=days_window)
+    all_subsidies = get_all_subsidies()
+
+    m_col1, m_col2, m_col3 = st.columns(3)
+    with m_col1:
+        st.metric(f"直近{days_window}日 新規", len(new_subsidies))
+    with m_col2:
+        st.metric("累計件数", len(all_subsidies))
+    with m_col3:
+        if not new_subsidies.empty and "source_category" in new_subsidies.columns:
+            top = new_subsidies["source_category"].value_counts().head(1)
+            label = f"{top.index[0]} ({int(top.iloc[0])})" if len(top) else "-"
+        else:
+            label = "-"
+        st.metric("最多区分", label)
+
+    if new_subsidies.empty:
+        st.info(
+            "指定期間内に検出された補助金はまだありません。"
+            "「今すぐ収集を実行」を押すか、GitHub Actions の実行を待ってください。"
+        )
+    else:
+        excel_bytes = build_excel_report(new_subsidies)
+        st.download_button(
+            "Excelダウンロード",
+            data=excel_bytes,
+            file_name=f"weekly_subsidy_report_{datetime.now():%Y%m%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+
+        display_cols = ["title", "source_category", "source_name", "summary",
+                        "url", "matched_keyword", "first_seen_at"]
+        display_cols = [c for c in display_cols if c in new_subsidies.columns]
+        labels = {
+            "title": "補助金名", "source_category": "区分", "source_name": "発信元",
+            "summary": "概要", "url": "URL", "matched_keyword": "ヒット条件",
+            "first_seen_at": "初回検出日時",
+        }
+        view_df = new_subsidies[display_cols].rename(columns=labels)
+        st.dataframe(
+            view_df,
+            use_container_width=True,
+            height=420,
+            column_config={
+                "URL": st.column_config.LinkColumn("URL", display_text="リンク"),
+                "概要": st.column_config.TextColumn("概要", width="large"),
+            },
+        )
+
+    with st.expander("累計（過去すべて）を表示"):
+        if all_subsidies.empty:
+            st.caption("まだ収集された補助金がありません。")
+        else:
+            st.dataframe(all_subsidies, use_container_width=True, height=320)
